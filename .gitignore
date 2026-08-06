@@ -1,3 +1,9 @@
 auto-save-list/
 elpa/
 *.elc
+eln-cache/
+history
+recentf
+transient/
+tree-sitter/
+projectile-*.eld
