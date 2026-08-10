@@ -16,6 +16,11 @@
 (eval-when-compile (require 'use-package))
 
 ;; ==============================
+;; Default directory
+;; ==============================
+(add-hook 'after-init-hook (lambda () (cd "/Volumes/SSD/Code")))
+
+;; ==============================
 ;; UI & general niceties
 ;; ==============================
 (use-package which-key
@@ -36,6 +41,27 @@
 (show-paren-mode +1)          ; highlight matching parens
 (setq-default indent-tabs-mode nil)
 (global-auto-revert-mode +1)  ; auto-reload files changed on disk (git pulls, etc.)
+
+;; ==============================
+;; Whitespace & tabs visualization
+;; ==============================
+(use-package whitespace
+  :ensure nil                ; built-in
+  :config
+  ;; Show: tab glyph + face, space dots + face, trailing whitespace highlight
+  (setq whitespace-style '(face tabs spaces trailing))
+  (setq whitespace-display-mappings
+        '((space-mark ?\s [?·] [?•])          ; space -> middle dot
+          (tab-mark ?\t [?» ?\t] [?\\ ?\t])))   ; tab  -> guillemet
+  ;; subtle colors: spaces grey, tabs amber, trailing whitespace red
+  (set-face-attribute 'whitespace-space nil :foreground "gray45" :background nil)
+  (set-face-attribute 'whitespace-tab nil :foreground "goldenrod" :background nil)
+  (set-face-attribute 'whitespace-trailing nil :background "red4")
+  (global-whitespace-mode +1))
+
+;; toggle per-buffer with C-c w; strip trailing whitespace before saving
+(global-set-key (kbd "C-c w") 'whitespace-mode)
+(add-hook 'before-save-hook 'delete-trailing-whitespace)
 
 ;; ==============================
 ;; Completion & search
@@ -143,6 +169,67 @@
    ("C-c p s" . projectile-ripgrep)))
 
 ;; ==============================
+;; File tree sidebar (treemacs)
+;; Shows a files/subdirs sidebar whenever the current directory is inside a
+;; git repo (has a .git marker); hides it otherwise.
+;; ==============================
+(use-package treemacs
+  :ensure t
+  :defer t
+  :config
+  (setq treemacs-width 28)
+  (treemacs-follow-mode +1)            ; highlight the current file in the tree
+  (treemacs-project-follow-mode +1))   ; keep tree synced to the active project
+
+(use-package treemacs-projectile
+  :ensure t
+  :after (treemacs projectile))
+
+(defvar my/treemacs-auto t
+  "When non-nil, auto-show the treemacs sidebar inside git repos.")
+
+(defun my/treemacs-hide ()
+  "Hide the treemacs sidebar, if it is visible."
+  (when (and my/treemacs-auto
+             (fboundp 'treemacs-current-visibility)
+             (eq (treemacs-current-visibility) 'visible))
+    (delete-window (treemacs-get-local-window))))
+
+(defun my/treemacs-show-root (root)
+  "Display treemacs showing project ROOT, avoiding the first-run prompt."
+  (require 'treemacs)
+  (let* ((ws (treemacs-current-workspace))
+         (path (treemacs-canonical-path root)))
+    ;; pre-add the project so `treemacs--init' never asks for a root
+    (unless (treemacs-is-path path :in-workspace ws)
+      (treemacs-do-add-project-to-workspace path nil))
+    (pcase (treemacs-current-visibility)
+      ('none   (treemacs--init))
+      ('exists (treemacs-select-window)))))
+
+(defun my/treemacs-sync ()
+  "Show the sidebar when the current directory is inside a git repo, else hide it."
+  (when my/treemacs-auto
+    (if-let ((root (locate-dominating-file default-directory ".git")))
+        (my/treemacs-show-root (file-truename root))
+      (my/treemacs-hide))))
+
+(add-hook 'find-file-hook #'my/treemacs-sync)
+(add-hook 'dired-mode-hook #'my/treemacs-sync)
+(add-hook 'projectile-after-switch-project-hook #'my/treemacs-sync)
+(add-hook 'emacs-startup-hook #'my/treemacs-sync)
+
+(defun my/treemacs-toggle-auto ()
+  "Toggle automatic show/hide of the sidebar in git repos."
+  (interactive)
+  (setq my/treemacs-auto (not my/treemacs-auto))
+  (message "treemacs auto-sync %s" (if my/treemacs-auto "on" "off"))
+  (when my/treemacs-auto (my/treemacs-sync)))
+
+(global-set-key (kbd "C-c t") 'treemacs)                 ; manual toggle
+(global-set-key (kbd "C-c T") 'my/treemacs-toggle-auto)  ; auto mode on/off
+
+;; ==============================
 ;; Git: magit (porcelain) + git-gutter (inline diff)
 ;; ==============================
 (use-package magit
@@ -192,6 +279,77 @@
       (process-send-string (get-buffer-process buf) "pi\n"))))
 
 (global-set-key (kbd "C-c p i") 'pi-launch-here)
+
+;; ==============================
+;; Pi token usage in the mode line
+;; (reads ~/.pi/agent/tokens.json written by the pi "token-usage" extension)
+;; ==============================
+(defcustom pi-tokens-file (expand-file-name "tokens.json" "~/.pi/agent/")
+  "JSON file written by the pi token-usage extension."
+  :type 'file
+  :group 'pi-coding-agent)
+
+(defvar pi-tokens--string "" "Cached pi token usage string.")
+(defvar pi-tokens--timer nil)
+
+(defun pi-tokens--fmt (n)
+  "Format token count N compactly (e.g. 1499 -> 1.5k)."
+  (cond ((or (null n) (not (numberp n))) "?")
+        ((< n 1000) (number-to-string n))
+        ((< n 10000) (format "%.1fk" (/ n 1000.0)))
+        (t (format "%dk" (/ n 1000)))))
+
+(defun pi-tokens--refresh ()
+  "Re-read pi token stats from `pi-tokens-file'."
+  (when (file-readable-p pi-tokens-file)
+    (condition-case nil
+        (let* ((j (json-read-file pi-tokens-file))
+               (in (alist-get 'input j))
+               (out (alist-get 'output j))
+               (cost (alist-get 'cost j))
+               (ctx (alist-get 'contextTokens j))
+               (win (alist-get 'contextWindow j))
+               (pct (alist-get 'percent j))
+               (pct-str (if (numberp pct) (format " (%.1f%%)" pct) "")))
+          (setq pi-tokens--string
+                (format "pi ↑%s ↓%s $%.3f %s/%s%s"
+                        (pi-tokens--fmt in) (pi-tokens--fmt out)
+                        (or cost 0.0)
+                        (pi-tokens--fmt ctx) (pi-tokens--fmt win)
+                        pct-str)))
+      (error (setq pi-tokens--string "")))))
+
+(define-minor-mode pi-tokens-modeline-mode
+  "Show pi token usage in the mode line."
+  :global t
+  :group 'pi-coding-agent
+  (if pi-tokens-modeline-mode
+      (progn
+        (pi-tokens--refresh)
+        (unless pi-tokens--timer
+          (setq pi-tokens--timer (run-with-idle-timer 5 t #'pi-tokens--refresh))))
+    (when pi-tokens--timer
+      (cancel-timer pi-tokens--timer)
+      (setq pi-tokens--timer nil))))
+
+(add-to-list 'mode-line-misc-info
+             '(:eval (when pi-tokens-modeline-mode pi-tokens--string)))
+(add-hook 'vterm-mode-hook #'pi-tokens--refresh)
+(pi-tokens-modeline-mode +1)
+
+;; ==============================
+;; Agent shell (agent-shell) — Pi as default agent
+;; ==============================
+(use-package agent-shell
+  :ensure t
+  :defer t
+  :config
+  ;; Pi integration uses the pi-acp ACP adapter (npm install -g pi-acp)
+  (setq agent-shell-pi-acp-command '("pi-acp"))
+  (setq agent-shell-preferred-agent-config 'pi))
+
+(global-set-key (kbd "C-c p a") 'agent-shell-pi-start-agent)
+
 (custom-set-variables
  ;; custom-set-variables was added by Custom.
  ;; If you edit it by hand, you could mess it up, so be careful.
@@ -199,7 +357,9 @@
  ;; If there is more than one, they won't work right.
  '(global-display-line-numbers-mode t)
  '(package-selected-packages
-   '(cape corfu consult git-gutter magit marginalia orderless pi-coding-agent projectile tree-sitter vterm vertico which-key))
+   '(agent-shell cape consult corfu git-gutter magit marginalia orderless
+                 pi-coding-agent projectile ripgrep tree-sitter
+                 vertico vterm which-key))
  '(tool-bar-mode nil)
  '(tooltip-mode nil))
 (custom-set-faces
